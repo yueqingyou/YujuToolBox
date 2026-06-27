@@ -23,11 +23,11 @@ apt update -y  && apt install -y wget
 ### 下载并执行
 用curl下载
 ```
-curl -sS -O https://raw.githubusercontent.com/yuju520/YujuToolBox/main/yuju.sh && chmod +x yuju.sh && ./yuju.sh
+curl -sS -O https://raw.githubusercontent.com/yueqingyou/YujuToolBox/main/yuju.sh && chmod +x yuju.sh && ./yuju.sh
 ```
 用wget下载
 ```
-wget -q https://raw.githubusercontent.com/yuju520/YujuToolBox/main/yuju.sh && chmod +x yuju.sh && ./yuju.sh
+wget -q https://raw.githubusercontent.com/yuju520/yueqingyou/main/yuju.sh && chmod +x yuju.sh && ./yuju.sh
 ```
 
 ## 功能介绍
