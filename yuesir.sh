@@ -1,19 +1,26 @@
 #!/bin/bash
 # 版本信息
 version="0.0.1"
+tool_name="yuesir"
+script_name="yuesir.sh"
+install_path="/usr/local/bin/yuesir"
+default_admin_user="yuesir"
+ssh_port_min=20000
+ssh_port_max=60000
+last_ssh_port=""
 
 # ─── 颜色定义 ────────────────────────────────────────────────
 white='\033[0m'
 green='\033[0;32m'
-blue='\033[0;34m'
 red='\033[31m'
 yellow='\033[33m'
-grey='\e[37m'
 pink='\033[38;5;218m'
 cyan='\033[96m'
 
 # 将脚本安装到全局路径（运行失败静默忽略）
-cp ./yuju.sh /usr/local/bin/yuju > /dev/null 2>&1
+if [[ -f "./$script_name" ]]; then
+    cp "./$script_name" "$install_path" > /dev/null 2>&1
+fi
 
 # ─── 公用工具函数 ─────────────────────────────────────────────
 
@@ -27,8 +34,8 @@ break_end() {
 }
 
 # 重新进入主菜单（用于子菜单快捷返回）
-yuju_sh() {
-    yuju
+yuesir_sh() {
+    "$tool_name"
     exit
 }
 
@@ -46,7 +53,341 @@ root_test() {
     clear
     if ! require_root; then
         break_end
-        yuju_sh
+        yuesir_sh
+    fi
+}
+
+restart_ssh_service() {
+    if systemctl restart sshd 2>/dev/null; then
+        return 0
+    fi
+    if systemctl restart ssh 2>/dev/null; then
+        return 0
+    fi
+    echo -e "${red}SSH 服务重启失败，请手动检查 sshd 配置。${white}"
+    return 1
+}
+
+sshd_effective_option_is_set() {
+    local option="$1" value="$2" sshd_bin option_lower value_lower
+    option_lower=$(printf '%s' "$option" | tr '[:upper:]' '[:lower:]')
+    value_lower=$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]')
+
+    if command -v sshd >/dev/null 2>&1; then
+        sshd_bin=$(command -v sshd)
+    elif [[ -x /usr/sbin/sshd ]]; then
+        sshd_bin="/usr/sbin/sshd"
+    else
+        return 1
+    fi
+
+    "$sshd_bin" -T 2>/dev/null | awk -v option="$option_lower" -v value="$value_lower" '
+        tolower($1) == option && tolower($2) == value { found = 1 }
+        END { exit found ? 0 : 1 }
+    '
+}
+
+sshd_option_is_set() {
+    local option="$1" value="$2" file="/etc/ssh/sshd_config"
+    grep -Eq "^[[:space:]]*${option}[[:space:]]+${value}([[:space:]]+#.*)?[[:space:]]*$" "$file" 2>/dev/null \
+        || sshd_effective_option_is_set "$option" "$value"
+}
+
+set_sshd_option() {
+    local option="$1" value="$2" file="/etc/ssh/sshd_config"
+
+    if sshd_option_is_set "$option" "$value"; then
+        return 1
+    fi
+
+    if grep -Eq "^[[:space:]]*#?[[:space:]]*${option}[[:space:]]+" "$file" 2>/dev/null; then
+        sed -i -E "s|^[[:space:]]*#?[[:space:]]*${option}[[:space:]].*|${option} ${value}|" "$file"
+    else
+        printf '\n%s %s\n' "$option" "$value" >> "$file"
+    fi
+    return 0
+}
+
+port_in_use() {
+    local port="$1"
+    if command -v ss >/dev/null 2>&1; then
+        ss -H -ltn 2>/dev/null | awk '{print $4}' | grep -Eq "[:.]${port}$"
+        return
+    fi
+    if command -v netstat >/dev/null 2>&1; then
+        netstat -ltn 2>/dev/null | awk 'NR>2 {print $4}' | grep -Eq "[:.]${port}$"
+        return
+    fi
+    return 1
+}
+
+generate_random_ssh_port() {
+    local port range attempt
+    range=$((ssh_port_max - ssh_port_min + 1))
+    for ((attempt = 1; attempt <= 100; attempt++)); do
+        if command -v shuf >/dev/null 2>&1; then
+            port=$(shuf -i "${ssh_port_min}-${ssh_port_max}" -n 1)
+        else
+            port=$(( (RANDOM * 32768 + RANDOM) % range + ssh_port_min ))
+        fi
+        if ! port_in_use "$port"; then
+            echo "$port"
+            return 0
+        fi
+    done
+    echo $(( (RANDOM * 32768 + RANDOM) % range + ssh_port_min ))
+}
+
+get_current_ssh_port() {
+    local file="/etc/ssh/sshd_config" port sshd_bin
+
+    if [[ -n "$last_ssh_port" ]]; then
+        echo "$last_ssh_port"
+        return 0
+    fi
+
+    if command -v sshd >/dev/null 2>&1; then
+        sshd_bin=$(command -v sshd)
+    elif [[ -x /usr/sbin/sshd ]]; then
+        sshd_bin="/usr/sbin/sshd"
+    fi
+
+    if [[ -n "$sshd_bin" ]]; then
+        port=$("$sshd_bin" -T 2>/dev/null | awk 'tolower($1) == "port" { print $2; exit }')
+        if [[ "$port" =~ ^[0-9]+$ ]]; then
+            echo "$port"
+            return 0
+        fi
+    fi
+
+    port=$(awk 'tolower($1) == "port" && $1 !~ /^#/ { value = $2 } END { print value }' "$file" 2>/dev/null)
+    if [[ "$port" =~ ^[0-9]+$ ]]; then
+        echo "$port"
+        return 0
+    fi
+
+    echo "22"
+}
+
+write_fail2ban_sshd_jail() {
+    local port="$1"
+
+    cat > /etc/fail2ban/jail.local <<EOF
+[DEFAULT]
+#忽略的IP列表,不受设置限制（白名单）
+ignoreip = 127.0.0.1
+
+#允许ipv6
+allowipv6 = auto
+
+#日志修改检测机制（gamin、polling和auto这三种）
+backend = systemd
+
+[sshd]
+
+#是否激活此项（true/false）
+enabled = true
+
+#过滤规则filter的名字，对应filter.d目录下的sshd.conf
+filter = sshd
+
+#ssh端口
+port = $port
+
+#动作的相关参数
+action = iptables[name=SSH, port=$port, protocol=tcp]
+
+#检测的系统的登陆日志文件
+logpath = %(sshd_log)s
+
+#屏蔽时间，单位：秒
+bantime = 86400
+
+#这个时间段内超过规定次数会被ban掉
+findtime = 86400
+
+#最大尝试次数
+maxretry = 3
+EOF
+}
+
+sync_fail2ban_ssh_port() {
+    local port="${1:-}"
+
+    if [[ -z "$port" ]]; then
+        port=$(get_current_ssh_port)
+    fi
+
+    if [[ ! -d /etc/fail2ban ]]; then
+        return 0
+    fi
+
+    write_fail2ban_sshd_jail "$port"
+    if systemctl is-active --quiet fail2ban; then
+        systemctl restart fail2ban
+    fi
+    echo "已同步 fail2ban SSH 保护端口为 $port"
+}
+
+ensure_root_ssh_key() {
+    mkdir -p /root/.ssh
+    chmod 700 /root/.ssh
+
+    if [[ -f /root/.ssh/id_rsa ]]; then
+        echo "root SSH Key 已存在"
+        if [[ ! -f /root/.ssh/id_rsa.pub ]]; then
+            ssh-keygen -y -f /root/.ssh/id_rsa > /root/.ssh/id_rsa.pub
+            chmod 644 /root/.ssh/id_rsa.pub
+            echo "已从现有私钥补全 root 公钥"
+        fi
+        return 1
+    fi
+
+    echo "创建 root SSH Key..."
+    ssh-keygen -t rsa -f /root/.ssh/id_rsa -q -N ""
+    chmod 600 /root/.ssh/id_rsa
+    chmod 644 /root/.ssh/id_rsa.pub
+    return 0
+}
+
+append_pubkey_for_user() {
+    local username="$1" home_dir="$2" pub_key="$3"
+    local ssh_dir authorized_keys
+    ssh_dir="$home_dir/.ssh"
+    authorized_keys="$ssh_dir/authorized_keys"
+
+    mkdir -p "$ssh_dir"
+    touch "$authorized_keys"
+    chmod 700 "$ssh_dir"
+    chmod 600 "$authorized_keys"
+
+    if grep -qxF -- "$pub_key" "$authorized_keys" 2>/dev/null; then
+        echo "${username} 的 authorized_keys 已包含 root 公钥，跳过追加"
+    else
+        printf '%s\n' "$pub_key" >> "$authorized_keys"
+        echo "已为 ${username} 写入 root 公钥"
+    fi
+
+    if [[ "$username" != "root" ]]; then
+        chown -R "${username}:${username}" "$ssh_dir"
+    fi
+}
+
+root_authorized_keys_has_content() {
+    [[ -f /root/.ssh/authorized_keys ]] \
+        && grep -Eq '^[[:space:]]*[^#[:space:]]' /root/.ssh/authorized_keys
+}
+
+ensure_root_authorized_keys() {
+    ensure_root_ssh_key || true
+    mkdir -p /root/.ssh
+    touch /root/.ssh/authorized_keys
+    chmod 700 /root/.ssh
+    chmod 600 /root/.ssh/authorized_keys
+
+    if root_authorized_keys_has_content; then
+        echo "root authorized_keys 已存在，使用现有 root 登录公钥"
+        return 0
+    fi
+
+    append_pubkey_for_user root /root "$(cat /root/.ssh/id_rsa.pub)"
+    echo "root 未配置 authorized_keys，已写入本机 root 公钥"
+}
+
+sync_root_authorized_keys_to_user() {
+    local username="$1" home_dir="$2"
+    local source="/root/.ssh/authorized_keys"
+    local ssh_dir authorized_keys
+    local key_line added=0 existing=0
+    ssh_dir="$home_dir/.ssh"
+    authorized_keys="$ssh_dir/authorized_keys"
+
+    ensure_root_authorized_keys
+
+    mkdir -p "$ssh_dir"
+    touch "$authorized_keys"
+    chmod 700 "$ssh_dir"
+    chmod 600 "$authorized_keys"
+
+    while IFS= read -r key_line; do
+        [[ "$key_line" =~ ^[[:space:]]*$ ]] && continue
+        [[ "$key_line" =~ ^[[:space:]]*# ]] && continue
+        if grep -qxF -- "$key_line" "$authorized_keys" 2>/dev/null; then
+            existing=$((existing + 1))
+        else
+            printf '%s\n' "$key_line" >> "$authorized_keys"
+            added=$((added + 1))
+        fi
+    done < "$source"
+
+    if [[ "$username" != "root" ]]; then
+        chown -R "${username}:${username}" "$ssh_dir"
+    fi
+
+    echo "已同步 root authorized_keys 到 ${username}，新增 ${added} 条，已存在 ${existing} 条"
+}
+
+ensure_user_group_membership() {
+    local username="$1" group_name="$2"
+
+    if ! getent group "$group_name" >/dev/null 2>&1; then
+        echo "未发现 ${group_name} 组，跳过 ${username} 加组"
+        return 0
+    fi
+
+    if id -nG "$username" | tr ' ' '\n' | grep -qxF -- "$group_name"; then
+        echo "${username} 已在 ${group_name} 组，跳过加组"
+        return 0
+    fi
+
+    usermod -aG "$group_name" "$username"
+    echo "已将 ${username} 加入 ${group_name} 组"
+}
+
+ensure_admin_user() {
+    local username="$1"
+
+    if ! [[ "$username" =~ ^[a-z_][a-z0-9_-]*[$]?$ ]]; then
+        echo -e "${red}用户名不合法: $username${white}"
+        return 1
+    fi
+
+    if ! command -v sudo >/dev/null 2>&1; then
+        apt install sudo -y
+    fi
+
+    if id "$username" >/dev/null 2>&1; then
+        echo "用户 $username 已存在，跳过创建"
+    else
+        useradd -m -s /bin/bash "$username"
+        echo "已创建普通用户 $username"
+    fi
+
+    ensure_user_group_membership "$username" sudo
+    ensure_user_group_membership "$username" docker
+}
+
+ensure_key_login_config() {
+    local changed=0
+
+    if set_sshd_option PubkeyAuthentication yes; then
+        echo "已开启 PubkeyAuthentication yes"
+        changed=1
+    else
+        echo "PubkeyAuthentication yes 已存在，跳过修改"
+    fi
+
+    if set_sshd_option PasswordAuthentication no; then
+        echo "已关闭 PasswordAuthentication no"
+        changed=1
+    else
+        echo "PasswordAuthentication no 已存在，跳过修改"
+    fi
+
+    if [[ "$changed" -eq 1 ]]; then
+        restart_ssh_service
+    else
+        echo "密钥登录已经正常开启，无需重启 SSH 服务"
     fi
 }
 
@@ -59,12 +400,13 @@ pkg_install() {
 }
 
 # ─── 授权检测 ─────────────────────────────────────────────────
+# shellcheck disable=SC2034
 user_authorization="false"
 
 # 用户协议确认
 user_agreement() {
     clear
-    echo -e "${pink}欢迎使用yuju一键工具${white}"
+    echo -e "${pink}欢迎使用${tool_name}一键工具${white}"
     echo "此脚本基于自用开发"
     echo -e "${red}请尽量通过选择脚本选项退出${white}"
     echo "如有问题，后果自负"
@@ -73,9 +415,8 @@ user_agreement() {
 
     if [ "$user_input" = "y" ] || [ "$user_input" = "Y" ]; then
         echo "已同意"
-        user_authorization="true"
-        sed -i 's/^user_authorization="false"/user_authorization="true"/' ./yuju.sh 2>/dev/null
-        sed -i 's/^user_authorization="false"/user_authorization="true"/' /usr/local/bin/yuju 2>/dev/null
+        sed -i 's/^user_authorization="false"/user_authorization="true"/' "./$script_name" 2>/dev/null
+        sed -i 's/^user_authorization="false"/user_authorization="true"/' "$install_path" 2>/dev/null
         apt install sudo -y
         clear
     else
@@ -86,15 +427,14 @@ user_agreement() {
 
 # 若已安装副本已授权，同步本地文件并更新内存变量
 authorization_check() {
-    if grep -q '^user_authorization="true"' /usr/local/bin/yuju 2>/dev/null; then
-        sed -i 's/^user_authorization="false"/user_authorization="true"/' ./yuju.sh 2>/dev/null
-        user_authorization="true"
+    if grep -q '^user_authorization="true"' "$install_path" 2>/dev/null; then
+        sed -i 's/^user_authorization="false"/user_authorization="true"/' "./$script_name" 2>/dev/null
     fi
 }
 
 # 若已安装副本未授权，则弹出协议确认
 authorization_false() {
-    if grep -q '^user_authorization="false"' /usr/local/bin/yuju 2>/dev/null; then
+    if grep -q '^user_authorization="false"' "$install_path" 2>/dev/null; then
         user_agreement
     fi
 }
@@ -173,7 +513,7 @@ show_sysinfo() {
     fi
     if lsmod 2>/dev/null | grep -q bbr; then
         bbr_mod_st="${green}✅ 已加载${white}"
-    elif grep -q 'CONFIG_TCP_CONG_BBR=y' /boot/config-$(uname -r) 2>/dev/null; then
+    elif grep -q 'CONFIG_TCP_CONG_BBR=y' "/boot/config-$(uname -r)" 2>/dev/null; then
         bbr_mod_st="${green}✅ 已内置${white}"
     else
         bbr_mod_st="${red}❌ 未加载${white}"
@@ -264,6 +604,7 @@ system_clean() {
         fi
         if [ -n "$kernel_packages" ]; then
             echo "找到旧内核，正在删除：$kernel_packages"
+            # shellcheck disable=SC2086
             $PURGE_CMD $kernel_packages > /dev/null 2>&1
             [[ "$PKG_MANAGER" == "apt" ]] && update-grub > /dev/null 2>&1
         else
@@ -427,10 +768,10 @@ EOF
     fi
 }
 
-# 1.5 将时区改为上海
+# 1.5 将时区改为洛杉矶
 system_time() {
-    sudo timedatectl set-timezone Asia/Shanghai
-    echo "已成功将时区改为上海"
+    timedatectl set-timezone America/Los_Angeles
+    echo "已成功将时区改为洛杉矶"
 }
 
 # ── SWAP 操作（三个独立函数，供子菜单和一键优化复用）──────────
@@ -438,7 +779,7 @@ system_time() {
 # 交互式添加 SWAP
 swap_create() {
     echo -e "${green}请输入需要添加的swap，建议为内存的2倍！【单位为MB】${white}"
-    read -p "请输入swap数值:" swapsize
+    read -r -p "请输入swap数值:" swapsize
     if grep -q "swapfile" /etc/fstab 2>/dev/null; then
         echo -e "${red}swapfile已存在，swap设置失败，请先删除swap后重新设置！${white}"
         return 1
@@ -528,93 +869,111 @@ system_swap() {
         echo -e "${green}2、删除swap${white}"
         echo -e "${green}0、返回主菜单${white}"
         echo -e "———————————————————————————————————————"
-        read -p "请输入数字 [0-2]:" num
+        read -r -p "请输入数字 [0-2]:" num
         case "$num" in
             1) swap_create ;;
             2) swap_delete ;;
-            0) clear; yuju_menu; return ;;
+            0) clear; yuesir_menu; return ;;
             *) clear; echo -e "${green}请输入正确数字 [0-2]${white}" ;;
         esac
     done
 }
 
 # 1.7 修改SSH端口
-# 可传入端口号参数（供一键优化使用），无参数则交互输入
+# 默认生成 20000-60000 范围内的随机端口；传参仅供内部复用
 system_ssh() {
     local port="${1:-}"
     if [[ -z "$port" ]]; then
-        read -p "请输入要设置的SSH端口号（按Enter使用默认端口55520）: " port
-        port=${port:-55520}
+        port=$(generate_random_ssh_port)
+        echo "已生成随机 SSH 端口: $port"
     fi
-    sudo sed -i "s/^#\?Port .*/Port $port/g" /etc/ssh/sshd_config
-    sudo systemctl restart sshd
-    echo "SSH端口已修改为 $port"
+
+    if ! [[ "$port" =~ ^[0-9]+$ ]] || (( port < ssh_port_min || port > ssh_port_max )); then
+        echo -e "${red}SSH端口必须在 ${ssh_port_min}-${ssh_port_max} 范围内${white}"
+        return 1
+    fi
+
+    last_ssh_port="$port"
+    if set_sshd_option Port "$port"; then
+        if ! restart_ssh_service; then
+            echo -e "${red}SSH端口配置已写入，但服务重启失败，fail2ban未同步端口。${white}"
+            return 1
+        fi
+        sync_fail2ban_ssh_port "$port"
+        echo "SSH端口已修改为 $port"
+    else
+        sync_fail2ban_ssh_port "$port"
+        echo "SSH端口已经是 $port，跳过修改和重启"
+    fi
 }
 
 # 1.8 安装 fail2ban
 system_fail2ban() {
+    local ssh_port
+
+    ssh_port=$(get_current_ssh_port)
     apt install fail2ban -y
-    sudo bash -c 'cat <<EOF > /etc/fail2ban/jail.local
-[DEFAULT]
-#忽略的IP列表,不受设置限制（白名单）
-ignoreip = 127.0.0.1
-
-#允许ipv6
-allowipv6 = auto
-
-#日志修改检测机制（gamin、polling和auto这三种）
-backend = systemd
-
-[sshd]
-
-#是否激活此项（true/false）
-enabled = true
-
-#过滤规则filter的名字，对应filter.d目录下的sshd.conf
-filter = sshd
-
-#ssh端口
-port = ssh
-
-#动作的相关参数
-action = iptables[name=SSH, port=ssh, protocol=tcp]
-
-#检测的系统的登陆日志文件
-logpath = /var/log/secure
-
-#屏蔽时间，单位：秒
-bantime = 86400
-
-#这个时间段内超过规定次数会被ban掉
-findtime = 86400
-
-#最大尝试次数
-maxretry = 3
-EOF'
-    sudo systemctl enable fail2ban
-    sudo systemctl restart fail2ban
+    write_fail2ban_sshd_jail "$ssh_port"
+    systemctl enable fail2ban
+    systemctl restart fail2ban
     clear
-    echo "已成功安装fail2ban"
+    echo "已成功安装fail2ban，SSH保护端口为 $ssh_port"
 }
 
 # 1.9 密钥登录
 system_keygen() {
-    if [ -f ~/.ssh/id_rsa ]; then
-        echo "SSH Key已经存在"
+    root_test
+    local user_home
+
+    ensure_root_authorized_keys
+    ensure_admin_user "$default_admin_user"
+    user_home=$(getent passwd "$default_admin_user" | cut -d: -f6)
+    sync_root_authorized_keys_to_user "$default_admin_user" "$user_home"
+
+    ensure_key_login_config
+    echo "root 与 ${default_admin_user} 密钥登录配置检查完成"
+    echo "您的 root SSH Key 为，请牢记："
+    cat /root/.ssh/id_rsa
+}
+
+# 1.10 关闭 root 密码登录并配置 yuesir sudo 用户
+system_secure_user() {
+    root_test
+    local username="${1:-$default_admin_user}"
+    local user_home changed=0
+
+    ensure_admin_user "$username" || return 1
+    user_home=$(getent passwd "$username" | cut -d: -f6)
+    sync_root_authorized_keys_to_user "$username" "$user_home"
+
+    if set_sshd_option PermitRootLogin prohibit-password; then
+        echo "已关闭 root 用户密码登录，保留 root 密钥登录"
+        changed=1
     else
-        echo "创建SSH Key..."
-        ssh-keygen -t rsa -f ~/.ssh/id_rsa -q -N ""
+        echo "PermitRootLogin prohibit-password 已存在，跳过修改"
     fi
-    cat ~/.ssh/id_rsa.pub >> ~/.ssh/authorized_keys
-    chmod 600 ~/.ssh/authorized_keys
-    chmod 700 ~/.ssh
-    sudo sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/g' /etc/ssh/sshd_config
-    sudo sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/g' /etc/ssh/sshd_config
-    sudo systemctl restart sshd
-    echo "密码登录已关闭！"
-    echo "密钥登录已开启！"
-    echo "您的SSH Key为，请牢记！"
-    cat ~/.ssh/id_rsa
+
+    if set_sshd_option PubkeyAuthentication yes; then
+        echo "已开启 PubkeyAuthentication yes"
+        changed=1
+    else
+        echo "PubkeyAuthentication yes 已存在，跳过修改"
+    fi
+
+    if set_sshd_option PasswordAuthentication no; then
+        echo "已关闭 PasswordAuthentication no"
+        changed=1
+    else
+        echo "PasswordAuthentication no 已存在，跳过修改"
+    fi
+
+    if [[ "$changed" -eq 1 ]]; then
+        restart_ssh_service
+    else
+        echo "root 密码登录已关闭且密钥登录已正常开启，无需重启 SSH 服务"
+    fi
+
+    echo "普通用户 $username 已完成 sudo 与密钥登录配置"
 }
 
 # ═══════════════════════════════════════════════════════════════
@@ -702,7 +1061,7 @@ ip_priority_test() {
     echo "$ipv6_output"
     echo ""
     echo "优先级测试:"
-    ipv6_priority=$(grep "precedence ::ffff:0:0/96" /etc/gai.conf 2>/dev/null | grep -v "#" | wc -l)
+    ipv6_priority=$(awk '/precedence ::ffff:0:0\/96/ && $0 !~ /^[[:space:]]*#/ {count++} END {print count+0}' /etc/gai.conf 2>/dev/null)
 
     if [[ "$ipv6_output" == "IPv6正常工作" && "$ipv4_output" == "IPv4正常工作" ]]; then
         if [ "$ipv6_priority" -gt 0 ]; then
@@ -979,11 +1338,11 @@ starship_install() {
 
     print_install() {
         for s in "bash" "zsh" "ion" "tcsh" "xonsh" "fish"; do
-            local config_file="~/.${s}rc"
+            local config_file="$HOME/.${s}rc"
             local config_cmd="eval \"\$(starship init ${s})\""
             case ${s} in
-                ion)   config_file="~/.config/ion/initrc"; config_cmd="eval \$(starship init ${s})" ;;
-                fish)  config_file="~/.config/fish/config.fish"; config_cmd="starship init fish | source" ;;
+                ion)   config_file="$HOME/.config/ion/initrc"; config_cmd="eval \$(starship init ${s})" ;;
+                fish)  config_file="$HOME/.config/fish/config.fish"; config_cmd="starship init fish | source" ;;
                 tcsh)  config_cmd="eval \`starship init ${s}\`" ;;
                 xonsh) config_cmd="execx(\$(starship init xonsh))" ;;
             esac
@@ -997,7 +1356,7 @@ starship_install() {
             local config_file config_cmd
             case ${s} in
                 elvish)
-                    config_file="~/.elvish/rc.elv"
+                    config_file="$HOME/.elvish/rc.elv"
                     config_cmd="eval (starship init elvish)"
                     warning="${warning} Only elvish v0.17 or higher is supported."
                     ;;
@@ -1119,7 +1478,9 @@ download_zsh() {
     apt install zsh -y && apt install curl -y
     chsh -s "$(which zsh)"
     ( starship_install -y ) || echo -e "${yellow}Starship 安装失败，已跳过${white}"
+    # shellcheck disable=SC2016
     echo 'eval "$(starship init zsh)"'  >> ~/.zshrc
+    # shellcheck disable=SC2016
     echo 'eval "$(starship init bash)"' >> ~/.bashrc
     echo "zsh+Starship安装完成,重新登录终端即可启用"
 }
@@ -1141,6 +1502,9 @@ docker_install() {
     clear
     if command -v docker &> /dev/null; then
         echo "Docker已经安装。"
+        if id "$default_admin_user" >/dev/null 2>&1; then
+            ensure_user_group_membership "$default_admin_user" docker
+        fi
         return 0
     fi
     local country
@@ -1160,6 +1524,9 @@ EOF
         echo "本机器地理位置不在中国，正在使用官方Docker安装脚本..."
         wget -qO- get.docker.com | bash
         touch /etc/docker/daemon.json
+    fi
+    if id "$default_admin_user" >/dev/null 2>&1; then
+        ensure_user_group_membership "$default_admin_user" docker
     fi
     echo "Docker安装过程完成。"
 }
@@ -1193,7 +1560,7 @@ docker_status() {
 # 4.3 清理无用的镜像容器网络
 docker_clean() {
     clear
-    read -p "$(echo -e "${yellow}提示: ${white}将清理无用的镜像容器网络，包括停止的容器，确定清理吗？(Y/N): ")" choice
+    read -r -p "$(echo -e "${yellow}提示: ${white}将清理无用的镜像容器网络，包括停止的容器，确定清理吗？(Y/N): ")" choice
     case "$choice" in
         [Yy]) docker system prune -af --volumes ;;
         [Nn]) ;;
@@ -1212,7 +1579,7 @@ docker_mirrors() {
     local new_mirror
     get_mirror_input() {
         while true; do
-            read -p "请输入镜像源地址（含http://或https://），输入'q'退出: " new_mirror
+            read -r -p "请输入镜像源地址（含http://或https://），输入'q'退出: " new_mirror
             [ "$new_mirror" = "q" ] && { echo "操作已取消。"; docker_manage; return; }
             [[ "$new_mirror" =~ ^https?:// ]] && break
             echo "错误：镜像源地址必须以 http:// 或 https:// 开头，请重新输入。"
@@ -1227,7 +1594,7 @@ docker_mirrors() {
     else
         echo "未检测到镜像源地址。"
         get_mirror_input
-        sudo cat > "$docker_daemon" << EOF
+        sudo tee "$docker_daemon" > /dev/null << EOF
 {
     "registry-mirrors": ["$new_mirror"]
 }
@@ -1262,10 +1629,19 @@ docker_ipv6_off() {
 # 4.9 卸载 Docker
 docker_uninstall() {
     clear
-    read -p "$(echo -e "${red}注意: ${white}确定卸载docker环境吗？(Y/N): ")" choice
+    local container_ids image_ids
+    read -r -p "$(echo -e "${red}注意: ${white}确定卸载docker环境吗？(Y/N): ")" choice
     case "$choice" in
         [Yy])
-            docker rm $(docker ps -a -q) && docker rmi $(docker images -q) && docker network prune
+            mapfile -t container_ids < <(docker ps -a -q)
+            mapfile -t image_ids < <(docker images -q)
+            if (( ${#container_ids[@]} > 0 )); then
+                docker rm "${container_ids[@]}"
+            fi
+            if (( ${#image_ids[@]} > 0 )); then
+                docker rmi "${image_ids[@]}"
+            fi
+            docker network prune
             sudo apt-get purge -y docker-engine docker docker.io docker-ce docker-ce-cli
             sudo rm -rf /var/lib/docker
             sudo rm -rf /etc/docker
@@ -1290,15 +1666,16 @@ system_related() {
         echo "2. 系统清理"
         echo "3. TCP调优"
         echo "4. 安装并启用 BBR"
-        echo "5. 将时区改为上海"
+        echo "5. 将时区改为洛杉矶"
         echo "6. 修改SWAP"
         echo "7. 修改SSH端口"
         echo "8. 安装fail2ban"
         echo "9. 密钥登录"
+        echo "10. 关闭root密码登录并配置yuesir用户"
         echo -e "${pink}========================${white}"
         echo "0. 返回主菜单"
         echo -e "${pink}========================${white}"
-        read -p "请输入你的选择: " sub_choice
+        read -r -p "请输入你的选择: " sub_choice
         case $sub_choice in
             1)  clear; system_update ;;
             2)  clear; system_clean ;;
@@ -1309,7 +1686,8 @@ system_related() {
             7)  clear; system_ssh ;;
             8)  clear; system_fail2ban ;;
             9)  clear; system_keygen ;;
-            0)  yuju_menu ;;
+            10) clear; system_secure_user "$default_admin_user" ;;
+            0)  yuesir_menu ;;
             *) echo "无效的输入!" ;;
         esac
         break_end
@@ -1330,7 +1708,7 @@ test_script() {
         echo -e "${pink}========================${white}"
         echo "0. 返回主菜单"
         echo -e "${pink}========================${white}"
-        read -p "请输入你的选择: " sub_choice
+        read -r -p "请输入你的选择: " sub_choice
         case $sub_choice in
             1) clear; bandwidth_test ;;
             2) clear; ip_test ;;
@@ -1338,7 +1716,7 @@ test_script() {
             4) clear; performance_test ;;
             5) clear; ip_priority_test ;;
             6) clear; io_info ;;
-            0) yuju_menu ;;
+            0) yuesir_menu ;;
             *) echo "无效的输入!" ;;
         esac
         break_end
@@ -1367,7 +1745,7 @@ useful_tools() {
         echo -e "${pink}========================${white}"
         echo "0. 返回主菜单"
         echo -e "${pink}========================${white}"
-        read -p "请输入你的选择: " sub_choice
+        read -r -p "请输入你的选择: " sub_choice
         case $sub_choice in
             1)  pkg_install curl ;;
             2)  pkg_install wget ;;
@@ -1381,7 +1759,7 @@ useful_tools() {
             10) pkg_install fzf ;;
             11) clear; download_zsh ;;
             12) clear; download_all ;;
-            0)  yuju_menu ;;
+            0)  yuesir_menu ;;
             *)  echo "无效的输入!" ;;
         esac
         break_end
@@ -1404,7 +1782,7 @@ docker_manage() {
         echo -e "${pink}========================${white}"
         echo "0. 返回主菜单"
         echo -e "${pink}========================${white}"
-        read -p "请输入你的选择: " sub_choice
+        read -r -p "请输入你的选择: " sub_choice
         case $sub_choice in
             1) clear; docker_install ;;
             2) clear; docker_status ;;
@@ -1413,7 +1791,7 @@ docker_manage() {
             5) clear; docker_ipv6_on ;;
             6) clear; docker_ipv6_off ;;
             9) clear; docker_uninstall ;;
-            0) yuju_menu ;;
+            0) yuesir_menu ;;
             *) echo "无效的输入!" ;;
         esac
         break_end
@@ -1433,66 +1811,72 @@ onekey_optimization() {
     echo "- 系统清理"
     echo -e "- TCP调优"
     echo -e "- 安装并启用 BBR"
-    echo -e "- 设置时区到${yellow}上海${white}"
+    echo -e "- 设置时区到${yellow}洛杉矶${white}"
     echo -e "- 自动设置${yellow}虚拟内存${white}"
     echo -e "- 安装fail2ban"
     echo -e "- 安装${yellow}所有常用工具${white}"
-    echo -e "- 设置SSH端口号为${yellow}55520${white}"
+    echo -e "- 随机设置SSH端口号为${yellow}${ssh_port_min}-${ssh_port_max}${white}范围内端口"
     echo -e "- 修改为密钥登录"
+    echo -e "- 关闭root用户密码登录并配置${yellow}${default_admin_user}${white} sudo/docker用户"
     echo -e "${pink}============================${white}"
     echo -e "${red}注意：请牢记端口号和密钥，否则重启后无法登录${white}"
-    read -p "确定一键优化吗？(Y/N): " choice
+    read -r -p "确定一键优化吗？(Y/N): " choice
 
     case "$choice" in
         [Yy])
             clear
             echo -e "${pink}============================${white}"
             system_update
-            echo -e "[${green}OK${white}] 1/10. 更新系统到最新"
+            echo -e "[${green}OK${white}] 1/11. 更新系统到最新"
 
             echo -e "${pink}============================${white}"
             system_clean
-            echo -e "[${green}OK${white}] 2/10. 清理系统垃圾文件"
+            echo -e "[${green}OK${white}] 2/11. 清理系统垃圾文件"
 
             echo -e "${pink}============================${white}"
             tcp_tune --auto
-            echo -e "[${green}OK${white}] 3/10. TCP调优"
+            echo -e "[${green}OK${white}] 3/11. TCP调优"
 
             echo -e "${pink}============================${white}"
             enable_bbr
-            echo -e "[${green}OK${white}] 4/10. 安装并启用 BBR"
+            echo -e "[${green}OK${white}] 4/11. 安装并启用 BBR"
 
 
             echo -e "${pink}============================${white}"
             system_time
-            echo -e "[${green}OK${white}] 5/10. 设置时区到${yellow}上海${white}"
+            echo -e "[${green}OK${white}] 5/11. 设置时区到${yellow}洛杉矶${white}"
 
             echo -e "${pink}============================${white}"
             swap_create_auto
-            echo -e "[${green}OK${white}] 6/10. 自动设置${yellow}虚拟内存${white}"
+            echo -e "[${green}OK${white}] 6/11. 自动设置${yellow}虚拟内存${white}"
 
             echo -e "${pink}============================${white}"
             system_fail2ban
-            echo -e "[${green}OK${white}] 7/10. 安装fail2ban"
+            echo -e "[${green}OK${white}] 7/11. 安装fail2ban"
 
             echo -e "${pink}============================${white}"
             download_all
             docker_install
-            echo -e "[${green}OK${white}] 8/10. 安装${yellow}Docker等常用工具${white}"
+            echo -e "[${green}OK${white}] 8/11. 安装${yellow}Docker等常用工具${white}"
 
             echo -e "${pink}============================${white}"
-            system_ssh 55520
-            echo -e "[${green}OK${white}] 9/10. 设置SSH端口号为${yellow}55520${white}"
+            system_ssh
+            echo -e "[${green}OK${white}] 9/11. 设置SSH端口号为${yellow}${last_ssh_port}${white}"
 
             echo -e "${pink}============================${white}"
             system_keygen
-            echo -e "[${green}OK${white}] 10/10. 修改为密钥登录"
+            echo -e "[${green}OK${white}] 10/11. 修改为密钥登录"
+
+            echo -e "${pink}============================${white}"
+            system_secure_user "$default_admin_user"
+            echo -e "[${green}OK${white}] 11/11. 关闭root密码登录并配置${yellow}${default_admin_user}${white} sudo/docker用户"
             echo -e "${pink}============================${white}"
 
             clear
             echo -e "${green}一键优化已完成${white}"
-            echo "您现在的SSH端口为55520，您的SSH Key如下，请牢记："
-            cat ~/.ssh/id_rsa
+            echo "您现在的SSH端口为${last_ssh_port}，普通sudo用户为${default_admin_user}"
+            echo "您的 root SSH Key 如下，请牢记："
+            cat /root/.ssh/id_rsa
             ;;
         [Nn])
             echo "已取消"
@@ -1507,7 +1891,7 @@ onekey_optimization() {
 # 主界面
 # ═══════════════════════════════════════════════════════════════
 
-yuju_menu() {
+yuesir_menu() {
     while true; do
         echo -e "${pink}============================${white}"
         echo -e "${pink}\   /  |    |     |   |    | "
@@ -1515,7 +1899,7 @@ yuju_menu() {
         echo "  |    |    |     |   |    | "
         echo -e "  |    |____|  ___|   |____| ${white}"
         echo -e "${pink}============================${white}"
-        echo -e "${pink}yuju工具箱 【v$version】        输入 ${red}yuju${pink} 可快速启动${white}"
+        echo -e "${pink}${tool_name}工具箱 【v$version】        输入 ${red}${tool_name}${pink} 可快速启动${white}"
         show_sysinfo
         echo -e "${pink}============================${white}"
         echo "1. 系统相关->"
@@ -1529,7 +1913,7 @@ yuju_menu() {
         echo -e "${pink}============================${white}"
         echo "0. 退出脚本"
         echo -e "${pink}============================${white}"
-        read -p "请输入你的选择: " choice
+        read -r -p "请输入你的选择: " choice
 
         case $choice in
             1)   clear; system_related ;;
@@ -1539,14 +1923,14 @@ yuju_menu() {
             9)   clear; onekey_optimization ;;
             555)
                 clear
-                echo "卸载yuju工具箱"
+                echo "卸载${tool_name}工具箱"
                 echo -e "${pink}============================${white}"
-                echo "将彻底卸载yuju工具箱，不影响已安装的功能"
-                read -p "确定继续吗？(Y/N): " confirm
+                echo "将彻底卸载${tool_name}工具箱，不影响已安装的功能"
+                read -r -p "确定继续吗？(Y/N): " confirm
                 if [[ "$confirm" == "Y" || "$confirm" == "y" ]]; then
                     clear
-                    rm -f /usr/local/bin/yuju
-                    rm -f ./yuju.sh
+                    rm -f "$install_path"
+                    rm -f "./$script_name"
                     echo "脚本已卸载，祝您生活愉快！"
                     exit
                 else
@@ -1562,7 +1946,7 @@ yuju_menu() {
 
 # ─── 入口 ─────────────────────────────────────────────────────
 if [ "$#" -eq 0 ]; then
-    yuju_menu
+    yuesir_menu
 else
     echo -e "无效参数"
 fi
