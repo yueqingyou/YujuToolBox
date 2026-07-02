@@ -344,6 +344,35 @@ ensure_user_group_membership() {
     echo "已将 ${username} 加入 ${group_name} 组"
 }
 
+ensure_passwordless_sudo() {
+    local username="$1"
+    local sudoers_file="/etc/sudoers.d/$username"
+    local sudoers_line="${username} ALL=(ALL:ALL) NOPASSWD:ALL"
+    local tmp_file
+
+    mkdir -p /etc/sudoers.d
+
+    if [[ -f "$sudoers_file" ]] && grep -qxF -- "$sudoers_line" "$sudoers_file" 2>/dev/null; then
+        chmod 440 "$sudoers_file"
+        echo "${username} 免密码 sudo 已存在，跳过配置"
+        return 0
+    fi
+
+    tmp_file=$(mktemp)
+    printf '%s\n' "$sudoers_line" > "$tmp_file"
+    chmod 440 "$tmp_file"
+
+    if command -v visudo >/dev/null 2>&1 && ! visudo -cf "$tmp_file" >/dev/null; then
+        rm -f "$tmp_file"
+        echo -e "${red}${username} 免密码 sudo 配置校验失败，已取消写入${white}"
+        return 1
+    fi
+
+    mv "$tmp_file" "$sudoers_file"
+    chmod 440 "$sudoers_file"
+    echo "已配置 ${username} 免密码 sudo"
+}
+
 ensure_admin_user() {
     local username="$1"
 
@@ -364,6 +393,7 @@ ensure_admin_user() {
     fi
 
     ensure_user_group_membership "$username" sudo
+    ensure_passwordless_sudo "$username" || return 1
     ensure_user_group_membership "$username" docker
 }
 
@@ -936,7 +966,7 @@ system_keygen() {
     cat /root/.ssh/id_rsa
 }
 
-# 1.10 关闭 root 密码登录并配置 yuesir sudo 用户
+# 1.10 关闭 root 密码登录并配置 yuesir 免密码 sudo 用户
 system_secure_user() {
     root_test
     local username="${1:-$default_admin_user}"
@@ -973,7 +1003,7 @@ system_secure_user() {
         echo "root 密码登录已关闭且密钥登录已正常开启，无需重启 SSH 服务"
     fi
 
-    echo "普通用户 $username 已完成 sudo 与密钥登录配置"
+    echo "普通用户 $username 已完成免密码 sudo 与密钥登录配置"
 }
 
 # ═══════════════════════════════════════════════════════════════
@@ -1671,7 +1701,7 @@ system_related() {
         echo "7. 修改SSH端口"
         echo "8. 安装fail2ban"
         echo "9. 密钥登录"
-        echo "10. 关闭root密码登录并配置yuesir用户"
+        echo "10. 关闭root密码登录并配置yuesir免密码sudo用户"
         echo -e "${pink}========================${white}"
         echo "0. 返回主菜单"
         echo -e "${pink}========================${white}"
@@ -1817,7 +1847,7 @@ onekey_optimization() {
     echo -e "- 安装${yellow}所有常用工具${white}"
     echo -e "- 随机设置SSH端口号为${yellow}${ssh_port_min}-${ssh_port_max}${white}范围内端口"
     echo -e "- 修改为密钥登录"
-    echo -e "- 关闭root用户密码登录并配置${yellow}${default_admin_user}${white} sudo/docker用户"
+    echo -e "- 关闭root用户密码登录并配置${yellow}${default_admin_user}${white} 免密码sudo/docker用户"
     echo -e "${pink}============================${white}"
     echo -e "${red}注意：请牢记端口号和密钥，否则重启后无法登录${white}"
     read -r -p "确定一键优化吗？(Y/N): " choice
@@ -1869,7 +1899,7 @@ onekey_optimization() {
 
             echo -e "${pink}============================${white}"
             system_secure_user "$default_admin_user"
-            echo -e "[${green}OK${white}] 11/11. 关闭root密码登录并配置${yellow}${default_admin_user}${white} sudo/docker用户"
+            echo -e "[${green}OK${white}] 11/11. 关闭root密码登录并配置${yellow}${default_admin_user}${white} 免密码sudo/docker用户"
             echo -e "${pink}============================${white}"
 
             clear
