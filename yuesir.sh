@@ -229,6 +229,123 @@ sync_fail2ban_ssh_port() {
     echo "已同步 fail2ban SSH 保护端口为 $port"
 }
 
+ensure_ufw_installed() {
+    if command -v ufw >/dev/null 2>&1; then
+        return 0
+    fi
+
+    apt install ufw -y
+}
+
+ufw_allow_tcp_port() {
+    local port="$1"
+    local comment="${2:-必要端口}"
+
+    if ! [[ "$port" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
+        echo -e "${red}UFW端口必须在 1-65535 范围内：$port${white}"
+        return 1
+    fi
+
+    ufw allow proto tcp to any port "$port" comment "$comment"
+}
+
+ufw_delete_tcp_port_if_present() {
+    local port="$1"
+
+    if ! [[ "$port" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
+        return 0
+    fi
+
+    if ! command -v ufw >/dev/null 2>&1; then
+        return 0
+    fi
+
+    ufw --force delete allow proto tcp to any port "$port" >/dev/null 2>&1 || true
+}
+
+allow_extra_ufw_tcp_ports() {
+    local extra_ports=()
+    local port
+
+    if [[ -z "${YUESIR_UFW_EXTRA_TCP_PORTS:-}" ]]; then
+        return 0
+    fi
+
+    read -r -a extra_ports <<< "$YUESIR_UFW_EXTRA_TCP_PORTS"
+    for port in "${extra_ports[@]}"; do
+        ufw_allow_tcp_port "$port" "yuesir extra TCP"
+        ufw route allow proto tcp to any port "$port" comment "yuesir extra TCP route"
+    done
+}
+
+configure_ufw_docker_guard() {
+    local after_rules="/etc/ufw/after.rules"
+    local tmp_file
+    local has_docker_chain=0
+    local has_forward_chain=0
+
+    if ! command -v docker >/dev/null 2>&1; then
+        return 0
+    fi
+
+    if [[ ! -f "$after_rules" ]]; then
+        return 0
+    fi
+
+    tmp_file=$(mktemp)
+    awk '
+        /# BEGIN YUESIR DOCKER UFW/ {skip = 1; next}
+        /# END YUESIR DOCKER UFW/ {skip = 0; next}
+        !skip {print}
+    ' "$after_rules" > "$tmp_file"
+
+    grep -Fq ':DOCKER-USER - [0:0]' "$tmp_file" && has_docker_chain=1
+    grep -Fq ':ufw-user-forward - [0:0]' "$tmp_file" && has_forward_chain=1
+    cp "$after_rules" "$after_rules.bak.$(date +%Y%m%d%H%M%S)"
+
+    awk \
+        -v has_docker_chain="$has_docker_chain" \
+        -v has_forward_chain="$has_forward_chain" '
+        /# End required lines/ {
+            if (has_docker_chain == 0) {
+                print ":DOCKER-USER - [0:0]"
+            }
+            if (has_forward_chain == 0) {
+                print ":ufw-user-forward - [0:0]"
+            }
+        }
+        /^COMMIT$/ && inserted == 0 {
+            print "# BEGIN YUESIR DOCKER UFW"
+            print "# Let UFW route rules run first and drop Docker inbound forwarding unless allowed."
+            print "-A DOCKER-USER -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT"
+            print "-A DOCKER-USER -i docker0 -j RETURN"
+            print "-A DOCKER-USER -i br+ -j RETURN"
+            print "-A DOCKER-USER -j ufw-user-forward"
+            print "-A DOCKER-USER -j DROP"
+            print "# END YUESIR DOCKER UFW"
+            inserted = 1
+        }
+        {print}
+    ' "$tmp_file" > "$after_rules"
+    rm -f "$tmp_file"
+    echo "已写入Docker转发UFW防护规则"
+}
+
+sync_ufw_ssh_port() {
+    local port="${1:-}"
+
+    if [[ -z "$port" ]]; then
+        port=$(get_current_ssh_port)
+    fi
+
+    if ! command -v ufw >/dev/null 2>&1; then
+        return 0
+    fi
+
+    ufw_allow_tcp_port "$port" "yuesir SSH"
+    echo "已同步 UFW SSH 放行端口为 $port"
+}
+
 ensure_root_ssh_key() {
     mkdir -p /root/.ssh
     chmod 700 /root/.ssh
@@ -913,6 +1030,7 @@ system_swap() {
 # 默认生成 20000-60000 范围内的随机端口；传参仅供内部复用
 system_ssh() {
     local port="${1:-}"
+    local previous_port
     if [[ -z "$port" ]]; then
         port=$(generate_random_ssh_port)
         echo "已生成随机 SSH 端口: $port"
@@ -923,16 +1041,32 @@ system_ssh() {
         return 1
     fi
 
-    last_ssh_port="$port"
+    previous_port=$(get_current_ssh_port)
     if set_sshd_option Port "$port"; then
+        if ! sync_ufw_ssh_port "$port"; then
+            set_sshd_option Port "$previous_port" >/dev/null 2>&1 || true
+            echo -e "${red}UFW端口同步失败，已回滚SSH配置并停止重启以避免失联。${white}"
+            return 1
+        fi
         if ! restart_ssh_service; then
-            echo -e "${red}SSH端口配置已写入，但服务重启失败，fail2ban未同步端口。${white}"
+            set_sshd_option Port "$previous_port" >/dev/null 2>&1 || true
+            restart_ssh_service >/dev/null 2>&1 || true
+            if [[ "$previous_port" != "$port" ]]; then
+                ufw_delete_tcp_port_if_present "$port"
+            fi
+            echo -e "${red}SSH端口配置已写入，但服务重启失败，已尝试回滚到原端口，fail2ban未同步端口。${white}"
             return 1
         fi
         sync_fail2ban_ssh_port "$port"
+        if [[ "$previous_port" != "$port" ]]; then
+            ufw_delete_tcp_port_if_present "$previous_port"
+        fi
+        last_ssh_port="$port"
         echo "SSH端口已修改为 $port"
     else
+        sync_ufw_ssh_port "$port" || return 1
         sync_fail2ban_ssh_port "$port"
+        last_ssh_port="$port"
         echo "SSH端口已经是 $port，跳过修改和重启"
     fi
 }
@@ -950,7 +1084,43 @@ system_fail2ban() {
     echo "已成功安装fail2ban，SSH保护端口为 $ssh_port"
 }
 
-# 1.9 密钥登录
+# 1.9 配置 UFW 最小防火墙
+system_ufw() {
+    root_test
+    local auto="${1:-}"
+    local ssh_port
+    local confirm
+
+    ssh_port=$(get_current_ssh_port)
+    if [[ "$auto" != "--auto" ]]; then
+        echo -e "${red}即将启用UFW：默认拒绝入站，仅放行SSH端口 ${ssh_port}/tcp。${white}"
+        echo "如需额外TCP端口，可先设置环境变量，例如：YUESIR_UFW_EXTRA_TCP_PORTS=\"80 443\""
+        read -r -p "确认继续配置UFW吗？(Y/N): " confirm
+        case "$confirm" in
+            [Yy]) ;;
+            *) echo "已取消UFW配置"; return 0 ;;
+        esac
+    fi
+
+    ensure_ufw_installed || return 1
+    ufw default deny incoming
+    ufw default allow outgoing
+    ufw default deny routed
+    ufw_allow_tcp_port "$ssh_port" "yuesir SSH"
+    allow_extra_ufw_tcp_ports
+    configure_ufw_docker_guard
+    systemctl enable ufw >/dev/null 2>&1 || true
+    ufw --force enable
+    ufw reload
+    clear
+    echo "UFW最小防火墙已启用，仅放行SSH端口 ${ssh_port}/tcp"
+    if [[ -n "${YUESIR_UFW_EXTRA_TCP_PORTS:-}" ]]; then
+        echo "额外TCP端口已放行：${YUESIR_UFW_EXTRA_TCP_PORTS}"
+    fi
+    ufw status verbose
+}
+
+# 1.10 密钥登录
 system_keygen() {
     root_test
     local user_home
@@ -966,7 +1136,7 @@ system_keygen() {
     cat /root/.ssh/id_rsa
 }
 
-# 1.10 关闭 root 密码登录并配置 yuesir 免密码 sudo 用户
+# 1.11 关闭 root 密码登录并配置 yuesir 免密码 sudo 用户
 system_secure_user() {
     root_test
     local username="${1:-$default_admin_user}"
@@ -1535,6 +1705,10 @@ docker_install() {
         if id "$default_admin_user" >/dev/null 2>&1; then
             ensure_user_group_membership "$default_admin_user" docker
         fi
+        if command -v ufw >/dev/null 2>&1; then
+            configure_ufw_docker_guard
+            ufw reload >/dev/null 2>&1 || true
+        fi
         return 0
     fi
     local country
@@ -1557,6 +1731,10 @@ EOF
     fi
     if id "$default_admin_user" >/dev/null 2>&1; then
         ensure_user_group_membership "$default_admin_user" docker
+    fi
+    if command -v ufw >/dev/null 2>&1; then
+        configure_ufw_docker_guard
+        ufw reload >/dev/null 2>&1 || true
     fi
     echo "Docker安装过程完成。"
 }
@@ -1700,8 +1878,9 @@ system_related() {
         echo "6. 修改SWAP"
         echo "7. 修改SSH端口"
         echo "8. 安装fail2ban"
-        echo "9. 密钥登录"
-        echo "10. 关闭root密码登录并配置yuesir免密码sudo用户"
+        echo "9. 配置UFW最小防火墙"
+        echo "10. 密钥登录"
+        echo "11. 关闭root密码登录并配置yuesir免密码sudo用户"
         echo -e "${pink}========================${white}"
         echo "0. 返回主菜单"
         echo -e "${pink}========================${white}"
@@ -1715,8 +1894,9 @@ system_related() {
             6)  clear; system_swap ;;
             7)  clear; system_ssh ;;
             8)  clear; system_fail2ban ;;
-            9)  clear; system_keygen ;;
-            10) clear; system_secure_user "$default_admin_user" ;;
+            9)  clear; system_ufw ;;
+            10) clear; system_keygen ;;
+            11) clear; system_secure_user "$default_admin_user" ;;
             0)  yuesir_menu ;;
             *) echo "无效的输入!" ;;
         esac
@@ -1846,6 +2026,7 @@ onekey_optimization() {
     echo -e "- 安装fail2ban"
     echo -e "- 安装${yellow}所有常用工具${white}"
     echo -e "- 随机设置SSH端口号为${yellow}${ssh_port_min}-${ssh_port_max}${white}范围内端口"
+    echo -e "- 配置UFW最小防火墙，仅放行必要端口"
     echo -e "- 修改为密钥登录"
     echo -e "- 关闭root用户密码登录并配置${yellow}${default_admin_user}${white} 免密码sudo/docker用户"
     echo -e "${pink}============================${white}"
@@ -1857,54 +2038,58 @@ onekey_optimization() {
             clear
             echo -e "${pink}============================${white}"
             system_update
-            echo -e "[${green}OK${white}] 1/11. 更新系统到最新"
+            echo -e "[${green}OK${white}] 1/12. 更新系统到最新"
 
             echo -e "${pink}============================${white}"
             system_clean
-            echo -e "[${green}OK${white}] 2/11. 清理系统垃圾文件"
+            echo -e "[${green}OK${white}] 2/12. 清理系统垃圾文件"
 
             echo -e "${pink}============================${white}"
             tcp_tune --auto
-            echo -e "[${green}OK${white}] 3/11. TCP调优"
+            echo -e "[${green}OK${white}] 3/12. TCP调优"
 
             echo -e "${pink}============================${white}"
             enable_bbr
-            echo -e "[${green}OK${white}] 4/11. 安装并启用 BBR"
+            echo -e "[${green}OK${white}] 4/12. 安装并启用 BBR"
 
 
             echo -e "${pink}============================${white}"
             system_time
-            echo -e "[${green}OK${white}] 5/11. 设置时区到${yellow}洛杉矶${white}"
+            echo -e "[${green}OK${white}] 5/12. 设置时区到${yellow}洛杉矶${white}"
 
             echo -e "${pink}============================${white}"
             swap_create_auto
-            echo -e "[${green}OK${white}] 6/11. 自动设置${yellow}虚拟内存${white}"
+            echo -e "[${green}OK${white}] 6/12. 自动设置${yellow}虚拟内存${white}"
 
             echo -e "${pink}============================${white}"
             system_fail2ban
-            echo -e "[${green}OK${white}] 7/11. 安装fail2ban"
+            echo -e "[${green}OK${white}] 7/12. 安装fail2ban"
 
             echo -e "${pink}============================${white}"
             download_all
             docker_install
-            echo -e "[${green}OK${white}] 8/11. 安装${yellow}Docker等常用工具${white}"
+            echo -e "[${green}OK${white}] 8/12. 安装${yellow}Docker等常用工具${white}"
 
             echo -e "${pink}============================${white}"
-            system_ssh
-            echo -e "[${green}OK${white}] 9/11. 设置SSH端口号为${yellow}${last_ssh_port}${white}"
+            system_ssh || return 1
+            echo -e "[${green}OK${white}] 9/12. 设置SSH端口号为${yellow}${last_ssh_port}${white}"
+
+            echo -e "${pink}============================${white}"
+            system_ufw --auto || return 1
+            echo -e "[${green}OK${white}] 10/12. 配置UFW最小防火墙"
 
             echo -e "${pink}============================${white}"
             system_keygen
-            echo -e "[${green}OK${white}] 10/11. 修改为密钥登录"
+            echo -e "[${green}OK${white}] 11/12. 修改为密钥登录"
 
             echo -e "${pink}============================${white}"
             system_secure_user "$default_admin_user"
-            echo -e "[${green}OK${white}] 11/11. 关闭root密码登录并配置${yellow}${default_admin_user}${white} 免密码sudo/docker用户"
+            echo -e "[${green}OK${white}] 12/12. 关闭root密码登录并配置${yellow}${default_admin_user}${white} 免密码sudo/docker用户"
             echo -e "${pink}============================${white}"
 
             clear
             echo -e "${green}一键优化已完成${white}"
-            echo "您现在的SSH端口为${last_ssh_port}，普通sudo用户为${default_admin_user}"
+            echo "您现在的SSH端口为${last_ssh_port}，UFW已仅放行必要端口，普通sudo用户为${default_admin_user}"
             echo "您的 root SSH Key 如下，请牢记："
             cat /root/.ssh/id_rsa
             ;;
